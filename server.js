@@ -6,127 +6,312 @@ const fs = require('fs');
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
-
 const PORT = process.env.PORT || 3000;
 
+app.use(express.static('public'));
+app.get('/', (req, res) => res.sendFile(__dirname + '/public/index.html'));
+
+// ── Fragen laden & Kategorien aufbauen ────────────────────────────────────────
+let allQuestions = JSON.parse(fs.readFileSync('questions.json', 'utf8'));
+
+// Jedem Fragen-Objekt eine Kategorie geben falls nicht vorhanden -> 'Allgemein'
+allQuestions = allQuestions.map(q => ({ ...q, category: q.category || 'Allgemein' }));
+
+const availableCategories = [...new Set(allQuestions.map(q => q.category))];
+
+// ── Räume & Spieler ───────────────────────────────────────────────────────────
+let rooms = {};
+let players = new Map();
 const disconnectTimeouts = {};
 
-app.use(express.static('public'));
-app.get('/', (req, res) => {
-    res.sendFile(__dirname + '/public/index.html');
-});
-
-let rooms = {}; // Hier speichern wir alle aktiven Räume
-let questions = JSON.parse(fs.readFileSync('questions.json', 'utf8'));
-let players = new Map(); 
-
-
-// Hilfsfunktion zum Mischen von Arrays (Fisher-Yates Shuffle)
+// ── Hilfsfunktionen ───────────────────────────────────────────────────────────
 function shuffle(array) {
-    for (let i = array.length - 1; i > 0; i--) {
+    const a = [...array];
+    for (let i = a.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
-        [array[i], array[j]] = [array[j], array[i]];
+        [a[i], a[j]] = [a[j], a[i]];
     }
-    return array;
+    return a;
 }
 
-// Hilfsfunktion: Gibt alle Spieler eines Raums zurück
-function getPlayersInRoom(roomId) {
-    return Array.from(players.values()).filter(p => p.roomId === roomId);
+function getQuestionsForRoom(room) {
+    let pool = allQuestions;
+    if (room.categories && room.categories.length > 0) {
+        pool = allQuestions.filter(q => room.categories.includes(q.category));
+    }
+    if (pool.length === 0) pool = allQuestions; // Fallback
+    return pool;
 }
 
-// Hilfsfunktion: Spieler sauber entfernen
+function pickQuestion(room) {
+    const pool = getQuestionsForRoom(room);
+    const remaining = pool.filter(q => !room.usedQuestionIds.has(q.question));
+    // Wenn alle durch -> used-Liste leeren und von vorne
+    if (remaining.length === 0) {
+        room.usedQuestionIds.clear();
+        return shuffle(pool)[0];
+    }
+    return shuffle(remaining)[0];
+}
+
 function leaveRoom(socketId) {
     const player = players.get(socketId);
     if (!player) return;
-
     const roomId = player.roomId;
     const room = rooms[roomId];
+    if (!room) return;
 
-    if (room) {
-        // Spieler aus dem Raum-Array löschen
-        room.players = room.players.filter(p => p.id !== socketId);
-        // Spieler aus der globalen Map löschen
-        players.delete(socketId);
+    room.players = room.players.filter(p => p.id !== socketId);
+    players.delete(socketId);
 
-        // Wenn der Raum jetzt leer ist -> Raum löschen
-        if (room.players.length === 0) {
-            delete rooms[roomId];
-        } else {
-            // Wenn der Host gegangen ist -> Neuen Host ernennen
-            if (room.host === socketId) {
-                room.host = room.players[0].id;
-                io.to(room.host).emit('youAreHost');
-            }
-            // Liste für alle anderen aktualisieren
-            io.to(roomId).emit('updatePlayerList', room.players);
+    if (room.players.length === 0) {
+        clearRoomTimers(room);
+        delete rooms[roomId];
+    } else {
+        if (room.host === socketId) {
+            room.host = room.players[0].id;
+            io.to(room.host).emit('youAreHost');
         }
+        io.to(roomId).emit('updatePlayerList', cleanPlayers(room.players));
     }
 }
 
+function clearRoomTimers(room) {
+    if (room.writeTimer) { clearInterval(room.writeTimer); room.writeTimer = null; }
+    if (room.voteTimer)  { clearInterval(room.voteTimer);  room.voteTimer  = null; }
+}
 
+// ── Timer-Logik ───────────────────────────────────────────────────────────────
+const WRITE_SECONDS = 90;
+const VOTE_SECONDS  = 60;
 
+function startWriteTimer(roomId) {
+    const room = rooms[roomId];
+    if (!room) return;
+    clearRoomTimers(room);
+    let remaining = room.writeSecs || WRITE_SECONDS;
+    io.to(roomId).emit('timerUpdate', { phase: 'WRITING', remaining });
+    room.writeTimer = setInterval(() => {
+        remaining--;
+        io.to(roomId).emit('timerUpdate', { phase: 'WRITING', remaining });
+        if (remaining <= 0) {
+            clearInterval(room.writeTimer);
+            room.writeTimer = null;
+            // Fehlende Antworten auffüllen
+            room.players.forEach(p => {
+                if (!p.currentAnswer) p.currentAnswer = '🤷';
+            });
+            startVotingPhase(roomId);
+        }
+    }, 1000);
+}
+
+function startVoteTimer(roomId) {
+    const room = rooms[roomId];
+    if (!room) return;
+    if (room.voteTimer) clearInterval(room.voteTimer);
+    let remaining = room.voteSecs || VOTE_SECONDS;
+    io.to(roomId).emit('timerUpdate', { phase: 'VOTING', remaining });
+    room.voteTimer = setInterval(() => {
+        remaining--;
+        io.to(roomId).emit('timerUpdate', { phase: 'VOTING', remaining });
+        if (remaining <= 0) {
+            clearInterval(room.voteTimer);
+            room.voteTimer = null;
+            // Fehlende Votes auffüllen mit zufälliger Antwort
+            room.players.forEach(p => {
+                if (!p.votedFor) {
+                    const opts = room.shuffledAnswers.filter(a => a.text !== p.currentAnswer);
+                    if (opts.length) p.votedFor = opts[Math.floor(Math.random() * opts.length)].text;
+                }
+            });
+            doReveal(roomId);
+        }
+    }, 1000);
+}
+
+// ── Voting & Reveal ───────────────────────────────────────────────────────────
+function startVotingPhase(roomId) {
+    const room = rooms[roomId];
+    if (!room) return;
+    room.phase = 'VOTING';
+
+    let allAnswers = [];
+
+    if (room.mode === 'presence') {
+        // Im Präsenz-Modus: Wissender hat seine eigene Formulierung abgeschickt
+        // → seine Antwort ist die "richtige", nicht der rohe Antworttext
+        room.players.forEach(p => {
+            if (!p.currentAnswer) return;
+            const isKnower = p.id === room.lastPresencePlayerId;
+            allAnswers.push({ text: p.currentAnswer, isCorrect: isKnower, creator: p.id });
+        });
+    } else {
+        allAnswers = [{ text: room.currentQuestion.answer, isCorrect: true, creator: 'SERVER' }];
+        room.players.forEach(p => {
+            if (p.currentAnswer && p.currentAnswer !== room.currentQuestion.answer) {
+                allAnswers.push({ text: p.currentAnswer, isCorrect: false, creator: p.id });
+            }
+        });
+    }
+
+    room.shuffledAnswers = shuffle(allAnswers);
+
+    // Immer {text, authorName} - authorName ist null im Digital-Modus
+    const answersPayload = room.shuffledAnswers.map(a => ({
+        text: String(a.text),
+        authorName: room.mode === 'presence'
+            ? (room.players.find(p => p.id === a.creator)?.name || null)
+            : null,
+    }));
+
+    io.to(roomId).emit('showVotingOptions', {
+        answers: answersPayload,
+        question: room.currentQuestion.question,
+    });
+
+    startVoteTimer(roomId);
+}
+
+function doReveal(roomId) {
+    const room = rooms[roomId];
+    if (!room || room.phase === 'REVEAL') return;
+    room.phase = 'REVEAL';
+
+    clearRoomTimers(room);
+
+    const knower = room.mode === 'presence'
+        ? room.players.find(p => p.id === room.lastPresencePlayerId)
+        : null;
+
+    // Im Präsenz-Modus: "richtige Antwort" ist die Formulierung des Wissenden
+    const correctText = knower
+        ? knower.currentAnswer
+        : room.currentQuestion.answer;
+
+    // Punkte berechnen
+    room.players.forEach(p => p.roundPoints = 0);
+    room.players.forEach(voter => {
+        if (!voter.votedFor) return;
+        if (knower && voter.id === knower.id) return; // Wissender kann nicht für sich selbst voten
+
+        const votedCorrect = voter.votedFor === correctText;
+
+        if (votedCorrect) {
+            voter.points      += 3;
+            voter.roundPoints += 3;
+            voter.statsCorrect = (voter.statsCorrect || 0) + 1;
+        } else {
+            const liar = room.players.find(p => p.currentAnswer === voter.votedFor && p.id !== voter.id);
+            if (liar && (!knower || liar.id !== knower.id)) {
+                liar.points       += 2;
+                liar.roundPoints  += 2;
+                liar.statsBluffed  = (liar.statsBluffed || 0) + 1;
+            }
+            voter.statsFooled = (voter.statsFooled || 0) + 1;
+        }
+    });
+
+    // Wissender: +1 pro Person die falsch votet
+    if (knower) {
+        const wrongVoters = room.players.filter(p =>
+            p.id !== knower.id && p.votedFor && p.votedFor !== correctText
+        ).length;
+        knower.points      += wrongVoters;
+        knower.roundPoints += wrongVoters;
+    }
+
+    io.to(roomId).emit('resultsRevealed', {
+        shuffledAnswers: room.shuffledAnswers,
+        players: cleanPlayers(room.players),
+        correctAnswer: correctText,
+        trueAnswer: room.currentQuestion.answer, // für Anzeige in der Auflösung
+        knowerName: knower ? knower.name : null,
+    });
+}
+
+// ── Präsenz-Modus Hilfsfunktionen ─────────────────────────────────────────────
+function pickPresencePlayer(room) {
+    // Zufällig, aber nicht denselben wie letzte Runde
+    const eligible = room.players.filter(p => p.id !== room.lastPresencePlayerId);
+    const pool = eligible.length > 0 ? eligible : room.players;
+    return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// ── Hilfsfunktion: saubere Player-Daten (ohne nicht-serialisierbare Objekte) ──
+function cleanPlayers(players) {
+    return players.map(({ voteLockTimer, ...rest }) => rest);
+}
+
+// ── Socket.io ─────────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
-    // Raum erstellen
-    socket.on('createRoom', ({ playerName, customCode, maxRounds }) => {
+
+    // Kategorien schicken wenn jemand connectet
+    socket.emit('categoriesAvailable', availableCategories);
+
+    // ── Raum erstellen ────────────────────────────────────────────────────────
+    socket.on('createRoom', ({ playerName, customCode, maxRounds, categories, mode, writeTimer, voteTimer }) => {
         let roomId = customCode ? customCode.trim().toUpperCase() : Math.random().toString(36).substring(2, 5).toUpperCase();
         if (rooms[roomId] && !customCode) roomId += Math.floor(Math.random() * 10);
 
-        // 1. Das Spieler-Objekt EINMAL definieren
-        const hostPlayer = { 
-            socketId: socket.id, 
-            id: socket.id, 
-            name: playerName, 
-            points: 0, 
-            roomId: roomId, 
-            isOffline: false,
-            currentAnswer: '',
-            votedFor: null,
-            roundPoints: 0
+        const hostPlayer = {
+            socketId: socket.id, id: socket.id, name: playerName,
+            points: 0, roomId, isOffline: false,
+            currentAnswer: '', votedFor: null, roundPoints: 0,
         };
 
-        // 2. In die globale Map UND in den neuen Raum setzen
-        players.set(socket.id, hostPlayer); 
-        
+        players.set(socket.id, hostPlayer);
         rooms[roomId] = {
             host: socket.id,
-            players: [hostPlayer], // Hier wird jetzt die Referenz auf hostPlayer genutzt
+            players: [hostPlayer],
             phase: 'LOBBY',
             currentRound: 0,
             maxRounds: parseInt(maxRounds) || 0,
             currentQuestion: null,
-            shuffledAnswers: []
+            shuffledAnswers: [],
+            usedQuestionIds: new Set(),
+            categories: categories || [],
+            mode: mode || 'digital', // 'digital' | 'presence'
+            lastPresencePlayerId: null,
+            writeTimer: null,
+            voteTimer: null,
+            writeSecs: Math.max(10, parseInt(writeTimer) || 90),
+            voteSecs:  Math.max(10, parseInt(voteTimer)  || 60),
         };
 
         socket.join(roomId);
-        socket.emit('roomCreated', { roomId, players: rooms[roomId].players, maxRounds: rooms[roomId].maxRounds });
+        socket.emit('roomCreated', {
+            roomId,
+            players: rooms[roomId].players,
+            maxRounds: rooms[roomId].maxRounds,
+            mode: rooms[roomId].mode,
+            writeTimer: rooms[roomId].writeSecs,
+            voteTimer:  rooms[roomId].voteSecs,
+        });
     });
 
-    // Raum beitreten
+    // ── Raum beitreten ────────────────────────────────────────────────────────
     socket.on('joinRoom', ({ roomId, playerName }) => {
         const room = rooms[roomId];
         if (!room) return socket.emit('error', 'Raum nicht gefunden');
 
-        const existingPlayer = Array.from(players.values()).find(p => 
+        // Reconnect?
+        const existingPlayer = Array.from(players.values()).find(p =>
             p.roomId === roomId && p.name === playerName && p.isOffline === true
         );
 
         if (existingPlayer) {
-            const oldSocketId = existingPlayer.socketId; 
-            if (disconnectTimeouts[playerName]) {
-                clearTimeout(disconnectTimeouts[playerName]);
-                delete disconnectTimeouts[playerName];
+            const oldSocketId = existingPlayer.socketId;
+            if (disconnectTimeouts[playerName + roomId]) {
+                clearTimeout(disconnectTimeouts[playerName + roomId]);
+                delete disconnectTimeouts[playerName + roomId];
             }
-
-            // --- DUBLETTEN-STOPPER ---
-            // Wir aktualisieren die ID direkt im Array
             const playerInArray = room.players.find(p => p.name === playerName);
             if (playerInArray) {
                 playerInArray.id = socket.id;
                 playerInArray.socketId = socket.id;
                 playerInArray.isOffline = false;
             }
-
             players.delete(oldSocketId);
             existingPlayer.socketId = socket.id;
             existingPlayer.id = socket.id;
@@ -134,326 +319,313 @@ io.on('connection', (socket) => {
             players.set(socket.id, existingPlayer);
 
             socket.join(roomId);
-            socket.emit('joinedSuccess', roomId); 
-            
-            socket.emit('initRejoin', { 
-                points: existingPlayer.points, 
+            socket.emit('joinedSuccess', roomId);
+            socket.emit('initRejoin', {
+                points: existingPlayer.points,
                 phase: room.phase,
                 currentQuestion: room.currentQuestion ? room.currentQuestion.question : null,
                 currentRound: room.currentRound,
                 maxRounds: room.maxRounds,
+                mode: room.mode,
+                writeTimer: room.writeSecs,
+                voteTimer:  room.voteSecs,
                 alreadySubmitted: existingPlayer.currentAnswer !== '',
                 shuffledAnswers: room.shuffledAnswers ? room.shuffledAnswers.map(a => a.text) : [],
-                myLastAnswer: existingPlayer.currentAnswer 
+                myLastAnswer: existingPlayer.currentAnswer,
             });
         } else {
-            // Normaler Join: Verhindern, dass jemand mit gleichem Namen joint, wenn Spieler online ist
-            if (room.players.find(p => p.name === playerName) /*&& playerInArray.isOffline === false*/) {
+            if (room.players.find(p => p.name === playerName && !p.isOffline)) {
                 return socket.emit('error', 'Name bereits im Spiel!');
             }
-
-            const newPlayer = { 
-                socketId: socket.id, id: socket.id, name: playerName, 
-                points: 0, roomId: roomId, isOffline: false,
-                currentAnswer: '', votedFor: null, roundPoints: 0 
+            const newPlayer = {
+                socketId: socket.id, id: socket.id, name: playerName,
+                points: 0, roomId, isOffline: false,
+                currentAnswer: '', votedFor: null, roundPoints: 0,
             };
             players.set(socket.id, newPlayer);
             room.players.push(newPlayer);
             socket.join(roomId);
             socket.emit('joinedSuccess', roomId);
         }
-        io.to(roomId).emit('updatePlayerList', room.players);
+        io.to(roomId).emit('updatePlayerList', cleanPlayers(room.players));
     });
 
-   // Spiel starten / Neue Frage (nur Host)
+    // ── Nächste Frage / Spiel starten ─────────────────────────────────────────
     socket.on('nextQuestion', (roomId) => {
         const room = rooms[roomId];
-        if (!room) return;
+        if (!room || socket.id !== room.host) return;
 
         room.currentRound++;
-        
-        // Prüfen ob Ende erreicht
+
         if (room.maxRounds > 0 && room.currentRound > room.maxRounds) {
-            io.to(roomId).emit('gameEnded', room.players);
-        } else {
-            // --- WICHTIG: Vorherige Antworten der Spieler löschen! ---
+            clearRoomTimers(room);
+            io.to(roomId).emit('gameEnded', { players: cleanPlayers(room.players), stats: computeStats(room) });
+            return;
+        }
+
+        // Reset
+        room.revealScheduled = false;
+        room.players.forEach(p => {
+            p.currentAnswer  = '';
+            p.votedFor       = null;
+            p.roundPoints    = 0;
+            p.voteLocked     = false;
+            clearTimeout(p.voteLockTimer);
+            p.voteLockTimer  = null;
+        });
+
+        const q = pickQuestion(room);
+        room.currentQuestion = q;
+        room.usedQuestionIds.add(q.question);
+        room.phase = 'WRITING';
+
+        io.to(roomId).emit('newQuestion', {
+            question: q.question,
+            category: q.category,
+            currentRound: room.currentRound,
+            maxRounds: room.maxRounds,
+            mode: room.mode,
+        });
+
+        // Präsenz-Modus: einem zufälligen Spieler die richtige Antwort schicken
+        if (room.mode === 'presence') {
+            const chosen = pickPresencePlayer(room);
+            room.lastPresencePlayerId = chosen.id;
+            // Dem gewählten Spieler privat die Antwort mitteilen
+            io.to(chosen.id).emit('youHaveTheAnswer', {
+                answer: q.answer,
+                playerName: chosen.name,
+            });
+            // Allen anderen sagen dass jemand die Antwort kennt
+            // Host bekommt keinen Namen (spielt ja mit!)
             room.players.forEach(p => {
-                p.currentAnswer = '';
-                p.votedFor = null;
-                p.roundPoints = 0;
+                if (p.id === chosen.id) return; // Wissender selbst überspringen
+                if (p.id === room.host) {
+                    // Host bekommt nur neutrale Info
+                    io.to(p.id).emit('presencePlayerChosen', { playerName: null });
+                } else {
+                    io.to(p.id).emit('presencePlayerChosen', { playerName: chosen.name });
+                }
             });
-
-            // --- WICHTIG: Eine zufällige Frage auswählen ---
-            const randomIndex = Math.floor(Math.random() * questions.length);
-            const randomQ = questions[randomIndex]; // Hier lag der Fehler (randomQ war nicht definiert)
-            room.currentQuestion = randomQ;
-            room.phase = 'WRITING';
-
-            io.to(roomId).emit('newQuestion', { 
-                question: randomQ.question, 
-                currentRound: room.currentRound, 
-                maxRounds: room.maxRounds 
-            });
+            // Im Präsenz-Modus kein Write-Timer
+        } else {
+            startWriteTimer(roomId);
         }
     });
 
-    // Manuelles Beenden durch Host
-    socket.on('forceEndGame', (roomId) => {
-        const room = rooms[roomId];
-        if (socket.id === room.host) {
-            io.to(roomId).emit('gameEnded', room.players);
-        }
-    });
-
-    // Antwort eines Spielers empfangen
+    // ── Antwort abschicken ────────────────────────────────────────────────────
     socket.on('submitAnswer', ({ roomId, answer }) => {
         const room = rooms[roomId];
-        if (!room) return;
+        if (!room || room.phase !== 'WRITING') return;
 
-        // Wir suchen den Spieler im RAUM-Array anhand seines Namens oder der aktuellen Socket-ID
-        // Das ist sicherer bei Reconnects!
         const player = room.players.find(p => p.id === socket.id);
-        
-        if (player) {
-            player.currentAnswer = answer;
-            console.log(`✅ Antwort von ${player.name} empfangen.`);
-            
-            io.to(roomId).emit('playerSubmitted', socket.id);
+        if (!player) return;
 
-            // WICHTIG: Wir prüfen nur Spieler, die NICHT offline sind ODER wir prüfen alle,
-            // aber wir stellen sicher, dass wir die Leichen im Array ignorieren.
-            const waitingFor = room.players.filter(p => p.currentAnswer === '');
+        const trimmed = answer.trim();
+        if (!trimmed) return;
 
-            if (waitingFor.length === 0) {
-                console.log("🚀 Alle Antworten da! Starte Voting...");
-                room.phase = 'VOTING';
-                
-                let allAns = [{ text: room.currentQuestion.answer, isCorrect: true, creator: 'SERVER' }];
-                room.players.forEach(p => {
-                    if (p.currentAnswer) {
-                        allAns.push({ text: p.currentAnswer, isCorrect: false, creator: p.id });
-                    }
-                });
-                
-                room.shuffledAnswers = shuffle(allAns);
-                io.to(roomId).emit('showVotingOptions', room.shuffledAnswers.map(a => a.text));
-            } else {
-                console.log(`⏳ Warte noch auf: ${waitingFor.map(p => p.name).join(', ')}`);
-            }
-        } else {
-            console.log("❌ Fehler: Ein Socket hat versucht zu antworten, der nicht im Raum-Array ist.");
+        player.currentAnswer = trimmed;
+        io.to(roomId).emit('playerSubmitted', socket.id);
+        io.to(roomId).emit('updatePlayerList', cleanPlayers(room.players));
+
+        // Alle abgegeben?
+        const allDone = room.players.every(p => p.currentAnswer !== '');
+        if (allDone) {
+            clearRoomTimers(room);
+            // Beide Modi: automatisch Voting starten
+            // Im Präsenz-Modus erst kurz warten damit alle ihr "abgeschickt" sehen
+            setTimeout(() => startVotingPhase(roomId), room.mode === 'presence' ? 1500 : 750);
         }
     });
 
-    function startVotingLogic(roomId) {
+    // ── Host startet Voting manuell (Präsenz-Modus) ───────────────────────────
+    socket.on('startVoting', (roomId) => {
         const room = rooms[roomId];
-        room.phase = 'VOTING';
-        
-        let allAnswers = [{ text: room.currentQuestion.answer, isCorrect: true, creator: 'SERVER' }];
-        room.players.forEach(p => {
-            if(p.currentAnswer) {
-                allAnswers.push({ text: p.currentAnswer, isCorrect: false, creator: p.id });
-            }
-        });
+        if (!room || socket.id !== room.host) return;
+        if (room.phase !== 'WRITING') return;
+        // Im Präsenz-Modus: Spieler haben keine Antwort eingetippt -> wir bauen
+        // die Optionen aus dem Array auf (jeder nennt seine Antwort mündlich,
+        // Host startet das Voting damit die Leute digital abstimmen können)
+        startVotingPhase(roomId);
+    });
 
-        room.shuffledAnswers = shuffle(allAnswers);
-        io.to(roomId).emit('showVotingOptions', room.shuffledAnswers.map(a => a.text));
-    }
-
-
-    // Spieler gibt seine Stimme ab
+    // ── Vote abschicken ───────────────────────────────────────────────────────
     socket.on('submitVote', ({ roomId, answerText }) => {
-        const room = rooms[roomId];
-        if (!room) return; // Sicherheitsscheck hinzugefügt
-        const player = room.players.find(p => p.id === socket.id);
+        try {
+            const room = rooms[roomId];
+            if (!room || room.phase !== 'VOTING') return;
+            const player = room.players.find(p => p.id === socket.id);
+            if (!player) return;
 
-        if (player && room.phase === 'VOTING') {
+            // Gesperrt? (nach 5s Countdown)
+            if (player.voteLocked) return;
+
+            // Umentscheidung erlaubt solange nicht gesperrt
             player.votedFor = answerText;
 
-            // 1. Allen zeigen, dass dieser Spieler gewählt hat
-            io.to(roomId).emit('playerSubmitted', socket.id);
-
-            // 2. Prüfen, ob ALLE Spieler gewählt haben
-            const allVoted = room.players.every(p => p.votedFor !== null);
-
-            if (allVoted) {
-                // HIER WAR DER FEHLER: Komma vor der 2000 hinzugefügt
-                setTimeout(() => {
-                    room.phase = 'REVEAL'; 
-
-                    // Punkteberechnung direkt hier durchführen, damit die Daten aktuell sind
-                    // Schritt A: Alle Rundenpunkte auf 0 setzen
-                    room.players.forEach(p => p.roundPoints = 0);
-
-                    // Schritt B: Punkte verteilen
-                    room.players.forEach(voter => {
-                        if (!voter.votedFor) return;
-                        if (voter.votedFor === room.currentQuestion.answer) {
-                            voter.points += 3;
-                            voter.roundPoints += 3;
-                        } else {
-                            const liar = room.players.find(p => p.currentAnswer === voter.votedFor);
-                            if (liar && liar.id !== voter.id) {
-                                liar.points += 2;
-                                liar.roundPoints += 2;
-                            }
-                        }
-                    });
-
-                    io.to(roomId).emit('resultsRevealed', {
-                        shuffledAnswers: room.shuffledAnswers,
-                        players: room.players,
-                        correctAnswer: room.currentQuestion.answer
-                    });
-                }, 1000); 
-            }
-        }
-    });
-
-    socket.on('revealResults', (roomId) => {
-        const room = rooms[roomId];
-        if (socket.id !== room.host) return;
-
-        room.phase = 'REVEAL';
-
-        // Punkteberechnung
-        room.players.forEach(player => {
-            let earnedPoints = 0; // Punkte nur für diese Runde
-
-            // Nur berechnen, wenn der Spieler überhaupt gevotet hat
-            if (player.votedFor) {
-                // 1. Hat der Spieler die richtige Antwort gewählt?
-                if (player.votedFor === room.currentQuestion.answer) {
-                    earnedPoints += 3;
-                } else {
-                    // 2. Er hat eine Lüge gewählt. Wer war der Urheber?
-                    // WICHTIG: Urheber finden, aber nicht sich selbst Punkte geben
-                    const liar = room.players.find(p => p.currentAnswer === player.votedFor);
-                    if (liar && liar.id !== player.id) {
-                        // Der Lügner bekommt Punkte (wird beim Lügner-Loop draufgerechnet)
-                        // Wir müssen das hier beim Lügner direkt addieren:
-                        liar.points += 2;
-                        
-                        // Wir müssen dem Lügner auch bescheid sagen, dass er Punkte bekommen hat
-                        // Da wir aber gerade über den "Voter" iterieren, ist das tricky.
-                        // BESSERER WEG UNTEN:
+            // 5s-Timer starten (nur beim ersten Vote)
+            if (!player.voteLockTimer) {
+                player.voteLockTimer = setTimeout(() => {
+                    player.voteLocked = true;
+                    player.voteLockTimer = null;
+                    // Jetzt prüfen ob alle fertig sind
+                    if (room.phase !== 'VOTING') return;
+                    const allDone = room.players.every(p => p.votedFor !== null);
+                    if (allDone && !room.revealScheduled) {
+                        room.revealScheduled = true;
+                        clearRoomTimers(room);
+                        setTimeout(() => doReveal(roomId), 2000);
                     }
-                }
+                }, 5000);
             }
-        });
 
-        // SAUBERE BERECHNUNG NEU AUFSETZEN (um Fehler zu vermeiden):
-        // Schritt A: Alle Rundenpunkte auf 0 setzen
-        room.players.forEach(p => p.roundPoints = 0);
+            io.to(roomId).emit('playerSubmitted', socket.id);
+            io.to(roomId).emit('updatePlayerList', cleanPlayers(room.players));
 
-        // Schritt B: Punkte verteilen
-        room.players.forEach(voter => {
-            if (!voter.votedFor) return;
-
-            // Fall 1: Voter hat Richtig getippt
-            if (voter.votedFor === room.currentQuestion.answer) {
-                voter.points += 3;
-                voter.roundPoints += 3;
-            } 
-            // Fall 2: Voter hat Lüge getippt
-            else {
-                const liar = room.players.find(p => p.currentAnswer === voter.votedFor);
-                if (liar && liar.id !== voter.id) {
-                    liar.points += 2;
-                    liar.roundPoints += 2;
-                }
+            // Alle haben abgestimmt → direkt aufdecken
+            const allVoted = room.players.every(p => p.votedFor !== null);
+            if (allVoted && !room.revealScheduled) {
+                room.revealScheduled = true;
+                room.players.forEach(p => {
+                    clearTimeout(p.voteLockTimer);
+                    p.voteLockTimer = null;
+                    p.voteLocked = true;
+                });
+                clearRoomTimers(room);
+                setTimeout(() => doReveal(roomId), 2000);
             }
-        });
-
-        // Daten senden (jetzt inklusive roundPoints im player objekt)
-        io.to(roomId).emit('resultsRevealed', {
-            players: room.players,
-            correctAnswer: room.currentQuestion.answer,
-            shuffledAnswers: room.shuffledAnswers
-        });
+        } catch(e) {
+            console.error('submitVote error:', e);
+        }
     });
 
-    socket.on('triggerRevealStep2', (roomId) => {
+    socket.on('lockVote', (roomId) => {
         const room = rooms[roomId];
-        if (socket.id === room.host) {
-            // Sag ALLEN Clients im Raum: "Zeigt jetzt die Lösung!"
-            io.to(roomId).emit('showFinalResult');
-        }
+        if (!room) return;
+        const player = room.players.find(p => p.id === socket.id);
+        if (player) player.voteLocked = true;
+    });
+
+    // ── Veto: Host bestraft Spieler (Präsenz-Modus) ─────────────────────────────
+    socket.on('vetoPlayer', ({ roomId, playerName }) => {
+        const room = rooms[roomId];
+        if (!room || socket.id !== room.host) return;
+        const target = room.players.find(p => p.name === playerName);
+        if (!target) return;
+        // Strafe: doppelte Rundengewinne abziehen (minimum 2)
+        const penalty = Math.max(2, target.roundPoints * 2);
+        target.points      -= penalty;
+        target.roundPoints -= penalty;
+        io.to(roomId).emit('vetoed', { playerName, penalty, players: cleanPlayers(room.players) });
+    });
+
+    // ── Host-Controls ─────────────────────────────────────────────────────────
+    socket.on('triggerShowAuthors', (roomId) => {
+        const room = rooms[roomId];
+        if (!room || socket.id !== room.host) return;
+        io.to(roomId).emit('showAuthors');
     });
 
     socket.on('triggerHighlightCorrect', (roomId) => {
         const room = rooms[roomId];
-        if (socket.id === room.host) {
-            io.to(roomId).emit('highlightCorrectAnswer');
-
-            setTimeout(() => {
-                io.to(roomId).emit('showAuthors');
-            }, 500);
+        if (!room || socket.id !== room.host) return;
+        io.to(roomId).emit('highlightCorrectAnswer');
+        // showAuthors nur im Präsenz-Modus (Digital macht's client-seitig)
+        if (room.mode === 'presence') {
+            setTimeout(() => io.to(roomId).emit('showAuthors'), 600);
         }
     });
 
-    // NEU: Host will die Autoren aufdecken
-    //socket.on('triggerShowAuthors', (roomId) => {
-    //    const room = rooms[roomId];
-    //    if (socket.id === room.host) {
-    //        io.to(roomId).emit('showAuthors');
-    //    }
-    //});
+    socket.on('forceEndGame', (roomId) => {
+        const room = rooms[roomId];
+        if (!room || socket.id !== room.host) return;
+        clearRoomTimers(room);
+        io.to(roomId).emit('gameEnded', { players: cleanPlayers(room.players), stats: computeStats(room) });
+    });
 
     socket.on('rematch', (roomId) => {
         const room = rooms[roomId];
-        if (!room) return;
-
-        // Nur der Host darf das Rematch starten
-        if (socket.id !== room.host) return;
-
-        // 1. Alle Punkte und Status-Werte zurücksetzen
+        if (!room || socket.id !== room.host) return;
+        clearRoomTimers(room);
         room.currentRound = 0;
-        room.players.forEach(p => {
-            p.points = 0;
-            p.currentAnswer = '';
-            p.votedFor = null;
-            p.roundPoints = 0;
-        });
-
-        // 2. Allen im Raum sagen, dass es von vorne losgeht (zurück in die Lobby)
+        room.usedQuestionIds.clear();
+        room.players.forEach(p => { p.points = 0; p.currentAnswer = ''; p.votedFor = null; p.roundPoints = 0; });
         io.to(roomId).emit('rematchStarted', room.players);
     });
 
+    // ── Disconnect ────────────────────────────────────────────────────────────
     socket.on('disconnect', () => {
         const player = players.get(socket.id);
-        if (player) {
-            const roomId = player.roomId;
-            const playerName = player.name;
-            
-            console.log(`${playerName} hat die Verbindung verloren. Warte 60s...`);
-            player.isOffline = true;
+        if (!player) return;
 
-            // Falls es schon einen Timer für diesen Namen gibt (sollte nicht sein, aber sicher ist sicher), löschen
-            if (disconnectTimeouts[playerName]) clearTimeout(disconnectTimeouts[playerName]);
+        const { roomId, name } = player;
+        const key = name + roomId;
+        console.log(`${name} getrennt. Warte 5min...`);
+        player.isOffline = true;
+        io.to(roomId).emit('updatePlayerList', rooms[roomId]?.players || []);
 
-            // Timer starten
-            disconnectTimeouts[playerName] = setTimeout(() => {
-                // Prüfen, ob der Spieler immer noch offline ist
-                const checkPlayer = Array.from(players.values()).find(p => p.name === playerName && p.roomId === roomId);
-                
-                if (checkPlayer && checkPlayer.isOffline) {
-                    console.log(`${playerName} ist nach 60s nicht zurückgekehrt. Lösche Spieler.`);
-                    leaveRoom(checkPlayer.socketId); // Deine Funktion zum Entfernen aus dem Spiel
-                    delete disconnectTimeouts[playerName];
-                }
-            }, 300000); // 5minuten (300 Sekunden) Gnadenfrist
-        }
+        if (disconnectTimeouts[key]) clearTimeout(disconnectTimeouts[key]);
+        disconnectTimeouts[key] = setTimeout(() => {
+            const check = Array.from(players.values()).find(p => p.name === name && p.roomId === roomId);
+            if (check && check.isOffline) {
+                leaveRoom(check.socketId);
+                delete disconnectTimeouts[key];
+            }
+        }, 300_000);
     });
 
-}); // Ende connection
-    
+    socket.on('youAreHost', () => {}); // Client-seitig behandelt
 
-server.listen(PORT, () => {
-    console.log(`Server läuft auf Port ${PORT}`);
+    // ── Reaktionen ────────────────────────────────────────────────────────────
+    socket.on('sendReaction', ({ roomId, emoji }) => {
+        const player = players.get(socket.id);
+        if (!player) return;
+        io.to(roomId).emit('reaction', { name: player.name, emoji });
+    });
 
+    // ── Raum freiwillig verlassen ─────────────────────────────────────────────
+    socket.on('leaveRoom', () => {
+        const player = players.get(socket.id);
+        if (!player) return;
+        const { roomId, name } = player;
+        const key = name + roomId;
+        if (disconnectTimeouts[key]) { clearTimeout(disconnectTimeouts[key]); delete disconnectTimeouts[key]; }
+        leaveRoom(socket.id);
+        socket.leave(roomId);
+        socket.emit('leftRoom');
+    });
 });
 
+// ── Statistiken berechnen ────────────────────────────────────────────────────
+function computeStats(room) {
+    const players = room.players;
+    if (!players.length) return [];
 
+    const stats = [];
 
+    // Bester Bluffer: meiste statsBluffed
+    const bluffer = [...players].sort((a,b) => (b.statsBluffed||0) - (a.statsBluffed||0))[0];
+    if ((bluffer.statsBluffed||0) > 0)
+        stats.push({ emoji: '🎭', title: 'Bester Bluffer', name: bluffer.name, value: `${bluffer.statsBluffed}x jemanden getäuscht` });
 
+    // Detektiv: meiste statsCorrect
+    const detective = [...players].sort((a,b) => (b.statsCorrect||0) - (a.statsCorrect||0))[0];
+    if ((detective.statsCorrect||0) > 0)
+        stats.push({ emoji: '🔍', title: 'Meisterhafter Detektiv', name: detective.name, value: `${detective.statsCorrect}x die Wahrheit erkannt` });
+
+    // Leichtgläubigster: meiste statsFooled
+    const fooled = [...players].sort((a,b) => (b.statsFooled||0) - (a.statsFooled||0))[0];
+    if ((fooled.statsFooled||0) > 0)
+        stats.push({ emoji: '🤡', title: 'Leichtgläubigster', name: fooled.name, value: `${fooled.statsFooled}x auf eine Lüge reingefallen` });
+
+    return stats;
+}
+
+process.on('uncaughtException', (err) => {
+    console.error('💥 Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('💥 Unhandled Rejection:', reason);
+});
+
+server.listen(PORT, () => console.log(`🎮 BluffIt läuft auf Port ${PORT}`));
